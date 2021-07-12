@@ -26,7 +26,7 @@
  */
 
 #include "py/mpconfig.h"
-#if MICROPY_PY_USSL && MICROPY_SSL_MBEDTLS
+//#if MICROPY_PY_USSL && MICROPY_SSL_MBEDTLS
 
 #include <stdio.h>
 #include <string.h>
@@ -43,6 +43,7 @@
 #include "mbedtls/pk.h"
 #include "mbedtls/entropy.h"
 #include "mbedtls/ctr_drbg.h"
+#include "mbedtls/timing.h"
 #include "mbedtls/debug.h"
 #include "mbedtls/error.h"
 
@@ -56,6 +57,7 @@ typedef struct _mp_obj_ssl_socket_t {
     mbedtls_x509_crt cacert;
     mbedtls_x509_crt cert;
     mbedtls_pk_context pkey;
+    mbedtls_timing_delay_context timer;
 } mp_obj_ssl_socket_t;
 
 struct ssl_args {
@@ -64,6 +66,8 @@ struct ssl_args {
     mp_arg_val_t server_side;
     mp_arg_val_t server_hostname;
     mp_arg_val_t do_handshake;
+    mp_arg_val_t identity;
+    mp_arg_val_t pre_shared_key;
 };
 
 STATIC const mp_obj_type_t ussl_socket_type;
@@ -75,6 +79,98 @@ STATIC void mbedtls_debug(void *ctx, int level, const char *file, int line, cons
     printf("DBG:%s:%04d: %s\n", file, line, str);
 }
 #endif
+
+/*
+ * Set delays to watch
+ */
+void _mbedtls_timing_set_delay( void *data, uint32_t int_ms, uint32_t fin_ms )
+{
+    mbedtls_timing_delay_context *ctx = (mbedtls_timing_delay_context *) data;
+
+    ctx->int_ms = int_ms;
+    ctx->fin_ms = fin_ms;
+
+    if( fin_ms != 0 )
+        (void) mbedtls_timing_get_timer( &ctx->timer, 1 );
+}
+
+/*
+ * Get number of delays expired
+ */
+int _mbedtls_timing_get_delay( void *data )
+{
+    mbedtls_timing_delay_context *ctx = (mbedtls_timing_delay_context *) data;
+    unsigned long elapsed_ms;
+
+    if( ctx->fin_ms == 0 )
+        return( -1 );
+
+    elapsed_ms = mbedtls_timing_get_timer( &ctx->timer, 0 );
+
+    if( elapsed_ms >= ctx->fin_ms )
+        return( 2 );
+
+    if( elapsed_ms >= ctx->int_ms )
+        return( 1 );
+
+    return( 0 );
+}
+
+#define MAX_CIPHERS 100
+static int psk_ciphers[MAX_CIPHERS];
+static int pki_ciphers[MAX_CIPHERS];
+static int processed_ciphers = 0;
+static void
+set_ciphersuites(mbedtls_ssl_config *conf, int is_psk)
+{
+  if (!processed_ciphers) {
+    const int *list = mbedtls_ssl_list_ciphersuites();
+    int *psk_list = psk_ciphers;
+    int *pki_list = pki_ciphers;
+
+    while (*list) {
+      const mbedtls_ssl_ciphersuite_t *cur =
+                                     mbedtls_ssl_ciphersuite_from_id(*list);
+
+      if (cur) {
+        if (mbedtls_ssl_ciphersuite_uses_psk(cur)) {
+          if (&psk_ciphers[MAX_CIPHERS] - psk_list > 1) {
+            *psk_list = *list;
+            psk_list++;
+          }
+          else {
+            static int done = 0;
+
+            if (!done) {
+              done = 1;
+              printf("psk_ciphers[MAX_CIPHERS] insufficient\n");
+            }
+          }
+        }
+        else {
+          if (&pki_ciphers[MAX_CIPHERS] - pki_list > 1) {
+            *pki_list = *list;
+            pki_list++;
+          }
+          else {
+            static int done = 0;
+
+            if (!done) {
+              done = 1;
+              printf("pki_ciphers[MAX_CIPHERS] insufficient\n");
+            }
+          }
+        }
+      }
+      list++;
+    }
+    /* zero terminate */
+    *psk_list = 0;
+    *pki_list = 0;
+    processed_ciphers = 1;
+  }
+  mbedtls_ssl_conf_ciphersuites(conf, is_psk ? psk_ciphers : pki_ciphers);
+}
 
 STATIC NORETURN void mbedtls_raise_error(int err) {
     // _mbedtls_ssl_send and _mbedtls_ssl_recv (below) turn positive error codes from the
@@ -121,7 +217,6 @@ STATIC int _mbedtls_ssl_send(void *ctx, const byte *buf, size_t len) {
 
     const mp_stream_p_t *sock_stream = mp_get_stream(sock);
     int err;
-
     mp_uint_t out_sz = sock_stream->write(sock, buf, len, &err);
     if (out_sz == MP_STREAM_ERROR) {
         if (mp_is_nonblocking_error(err)) {
@@ -151,10 +246,9 @@ STATIC int _mbedtls_ssl_recv(void *ctx, byte *buf, size_t len) {
     }
 }
 
-
 STATIC mp_obj_ssl_socket_t *socket_new(mp_obj_t sock, struct ssl_args *args) {
     // Verify the socket object has the full stream protocol
-    mp_get_stream_raise(sock, MP_STREAM_OP_READ | MP_STREAM_OP_WRITE | MP_STREAM_OP_IOCTL);
+    mp_get_stream_raise(sock, MP_STREAM_OP_READ | MP_STREAM_OP_WRITE | MP_STREAM_OP_IOCTL);    
 
     #if MICROPY_PY_USSL_FINALISER
     mp_obj_ssl_socket_t *o = m_new_obj_with_finaliser(mp_obj_ssl_socket_t);
@@ -167,13 +261,13 @@ STATIC mp_obj_ssl_socket_t *socket_new(mp_obj_t sock, struct ssl_args *args) {
     int ret;
     mbedtls_ssl_init(&o->ssl);
     mbedtls_ssl_config_init(&o->conf);
-    mbedtls_x509_crt_init(&o->cacert);
-    mbedtls_x509_crt_init(&o->cert);
-    mbedtls_pk_init(&o->pkey);
+    /*mbedtls_x509_crt_init(&o->cacert);
+    mbedtls_x509_crt_init(&o->cert);    
+    mbedtls_pk_init(&o->pkey)*/
     mbedtls_ctr_drbg_init(&o->ctr_drbg);
     #ifdef MBEDTLS_DEBUG_C
     // Debug level (0-4) 1=warning, 2=info, 3=debug, 4=verbose
-    mbedtls_debug_set_threshold(0);
+    mbedtls_debug_set_threshold(4);
     #endif
 
     mbedtls_entropy_init(&o->entropy);
@@ -182,25 +276,21 @@ STATIC mp_obj_ssl_socket_t *socket_new(mp_obj_t sock, struct ssl_args *args) {
     if (ret != 0) {
         goto cleanup;
     }
-
+    
     ret = mbedtls_ssl_config_defaults(&o->conf,
-        args->server_side.u_bool ? MBEDTLS_SSL_IS_SERVER : MBEDTLS_SSL_IS_CLIENT,
-        MBEDTLS_SSL_TRANSPORT_STREAM,
+        MBEDTLS_SSL_IS_CLIENT,        
+        MBEDTLS_SSL_TRANSPORT_DATAGRAM,
         MBEDTLS_SSL_PRESET_DEFAULT);
     if (ret != 0) {
         goto cleanup;
     }
 
-    mbedtls_ssl_conf_authmode(&o->conf, MBEDTLS_SSL_VERIFY_NONE);
+    mbedtls_ssl_conf_authmode(&o->conf, MBEDTLS_SSL_VERIFY_REQUIRED);        
     mbedtls_ssl_conf_rng(&o->conf, mbedtls_ctr_drbg_random, &o->ctr_drbg);
+    mbedtls_ssl_conf_handshake_timeout(&o->conf, 1000, 60000);
     #ifdef MBEDTLS_DEBUG_C
     mbedtls_ssl_conf_dbg(&o->conf, mbedtls_debug, NULL);
     #endif
-
-    ret = mbedtls_ssl_setup(&o->ssl, &o->conf);
-    if (ret != 0) {
-        goto cleanup;
-    }
 
     if (args->server_hostname.u_obj != mp_const_none) {
         const char *sni = mp_obj_str_get_str(args->server_hostname.u_obj);
@@ -208,9 +298,7 @@ STATIC mp_obj_ssl_socket_t *socket_new(mp_obj_t sock, struct ssl_args *args) {
         if (ret != 0) {
             goto cleanup;
         }
-    }
-
-    mbedtls_ssl_set_bio(&o->ssl, &o->sock, _mbedtls_ssl_send, _mbedtls_ssl_recv, NULL);
+    }    
 
     if (args->key.u_obj != mp_const_none) {
         size_t key_len;
@@ -237,20 +325,43 @@ STATIC mp_obj_ssl_socket_t *socket_new(mp_obj_t sock, struct ssl_args *args) {
         }
     }
 
+    if (args->identity.u_obj != mp_const_none && args->pre_shared_key.u_obj != mp_const_none) {        
+        size_t id_len;
+        size_t psk_len;
+        const byte *id = (const byte *)mp_obj_str_get_data(args->identity.u_obj, &id_len);
+        const byte *psk = (const byte *)mp_obj_str_get_data(args->pre_shared_key.u_obj, &psk_len);
+        // len should include terminating null
+        ret = mbedtls_ssl_conf_psk(&o->conf, (const unsigned char *) psk, psk_len, (const unsigned char *) id, id_len);
+        if (ret != 0) {
+            ret = MBEDTLS_ERR_PK_BAD_INPUT_DATA; // use general error for all key errors
+            goto cleanup;
+        }
+        set_ciphersuites(&o->conf, 1);
+    }
+
+    ret = mbedtls_ssl_setup(&o->ssl, &o->conf);
+    if (ret != 0) {
+        goto cleanup;
+    }
+
+    mbedtls_ssl_set_bio(&o->ssl, &o->sock, _mbedtls_ssl_send, _mbedtls_ssl_recv, NULL);    
+    mbedtls_ssl_set_timer_cb(&o->ssl, &o->timer,
+                           mbedtls_timing_set_delay,
+                           mbedtls_timing_get_delay);
+
     if (args->do_handshake.u_bool) {
         while ((ret = mbedtls_ssl_handshake(&o->ssl)) != 0) {
-            if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
+            if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {                
                 goto cleanup;
             }
         }
     }
-
     return o;
 
 cleanup:
-    mbedtls_pk_free(&o->pkey);
+    /*mbedtls_pk_free(&o->pkey);
     mbedtls_x509_crt_free(&o->cert);
-    mbedtls_x509_crt_free(&o->cacert);
+    mbedtls_x509_crt_free(&o->cacert);*/
     mbedtls_ssl_free(&o->ssl);
     mbedtls_ssl_config_free(&o->conf);
     mbedtls_ctr_drbg_free(&o->ctr_drbg);
@@ -341,10 +452,10 @@ STATIC MP_DEFINE_CONST_FUN_OBJ_2(socket_setblocking_obj, socket_setblocking);
 STATIC mp_uint_t socket_ioctl(mp_obj_t o_in, mp_uint_t request, uintptr_t arg, int *errcode) {
     mp_obj_ssl_socket_t *self = MP_OBJ_TO_PTR(o_in);
     if (request == MP_STREAM_CLOSE) {
-        mbedtls_pk_free(&self->pkey);
+        /*mbedtls_pk_free(&self->pkey);
         mbedtls_x509_crt_free(&self->cert);
-        mbedtls_x509_crt_free(&self->cacert);
-        mbedtls_ssl_free(&self->ssl);
+        mbedtls_x509_crt_free(&self->cacert);       
+        mbedtls_ssl_free(&self->ssl);*/
         mbedtls_ssl_config_free(&self->conf);
         mbedtls_ctr_drbg_free(&self->ctr_drbg);
         mbedtls_entropy_free(&self->entropy);
@@ -389,10 +500,12 @@ STATIC mp_obj_t mod_ssl_wrap_socket(size_t n_args, const mp_obj_t *pos_args, mp_
     // TODO: Implement more args
     static const mp_arg_t allowed_args[] = {
         { MP_QSTR_key, MP_ARG_KW_ONLY | MP_ARG_OBJ, {.u_rom_obj = MP_ROM_NONE} },
-        { MP_QSTR_cert, MP_ARG_KW_ONLY | MP_ARG_OBJ, {.u_rom_obj = MP_ROM_NONE} },
+        { MP_QSTR_cert, MP_ARG_KW_ONLY | MP_ARG_OBJ, {.u_rom_obj = MP_ROM_NONE} },        
         { MP_QSTR_server_side, MP_ARG_KW_ONLY | MP_ARG_BOOL, {.u_bool = false} },
         { MP_QSTR_server_hostname, MP_ARG_KW_ONLY | MP_ARG_OBJ, {.u_rom_obj = MP_ROM_NONE} },
         { MP_QSTR_do_handshake, MP_ARG_KW_ONLY | MP_ARG_BOOL, {.u_bool = true} },
+        { MP_QSTR_identity, MP_ARG_KW_ONLY | MP_ARG_OBJ, {.u_rom_obj = MP_ROM_NONE} },
+        { MP_QSTR_pre_shared_key, MP_ARG_KW_ONLY | MP_ARG_OBJ, {.u_rom_obj = MP_ROM_NONE} },
     };
 
     // TODO: Check that sock implements stream protocol
@@ -418,4 +531,4 @@ const mp_obj_module_t mp_module_ussl = {
     .globals = (mp_obj_dict_t *)&mp_module_ssl_globals,
 };
 
-#endif // MICROPY_PY_USSL
+//#endif // MICROPY_PY_USSL
